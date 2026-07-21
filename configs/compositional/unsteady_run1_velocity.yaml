@@ -1,0 +1,57 @@
+# Run-1-style baseline for unsteady, velocity-only LDC.
+# Keeps the original Run 1 supervision weights:
+#   reconstruction = 1.0, regime = 0.1, geometry = 0.1, decorrelation = 0.01
+# No same-factor invariance, swap consistency, cross-Re swap, or static SDF encoder.
+# Temporal losses are the minimum additions required to learn unsteady evolution.
+
+data:
+  unsteady: true
+  file_path_train: /work/mech-ai/haydenc1/data/unsteady_ldc_train.npz
+  file_path_test: /work/mech-ai/haydenc1/data/unsteady_ldc_test.npz
+  resolution: 128
+  sequence_length: 8
+  sequence_stride: 1
+  batch_size: 8
+  num_workers: 4
+
+model:
+  in_channels: 2
+  base_channels: 32
+  latent_mu: 4
+  latent_g: 32
+  latent_eta: 16
+  latent_xi: 8
+  sdf_resolution: 64
+
+  # Match Run 1 conceptually: geometry is inferred from the velocity field.
+  static_geometry: false
+
+  # Original Run 1 loss weights.
+  lambda_recon: 1.0
+  lambda_regime: 0.1
+  lambda_geo: 0.1
+  lambda_decorr: 0.01
+
+  # Unsteady-only additions.
+  lambda_temporal: 1.0
+  lambda_latent: 0.1
+  lambda_static: 0.0
+  rollout_steps: 4
+  lr: 0.001
+
+trainer:
+  project: compositional_unsteady_run1_velocity
+  wandb: false
+  accelerator: auto
+  devices: 1
+  max_epochs: 200
+  log_every_n_steps: 10
+  seed: 0
+
+callbacks:
+  checkpoint:
+    dirpath: ./checkpoints/compositional_unsteady_run1_velocity
+    filename: cae-unsteady-run1-{epoch:03d}
+    monitor: val_loss_full
+    mode: min
+    save_top_k: 1

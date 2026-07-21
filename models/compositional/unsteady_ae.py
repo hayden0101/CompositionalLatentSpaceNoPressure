@@ -20,7 +20,8 @@ class UnsteadyCompositionalAE(pl.LightningModule):
                  sdf_resolution=64, static_geometry=True,
                  lambda_recon=1.0, lambda_regime=0.1, lambda_geo=0.1,
                  lambda_decorr=0.01, lambda_temporal=1.0,
-                 lambda_latent=0.1, rollout_steps=4, lr=1e-3):
+                 lambda_latent=0.1, lambda_static=0.0,
+                 rollout_steps=4, lr=1e-3):
         super().__init__()
         self.save_hyperparameters()
         self.encoder = FieldEncoder(in_channels, resolution, base_channels,
@@ -93,7 +94,8 @@ class UnsteadyCompositionalAE(pl.LightningModule):
         total = (hp.lambda_recon * loss_recon + hp.lambda_regime * loss_regime
                  + hp.lambda_geo * loss_geo + hp.lambda_decorr * loss_decorr
                  + hp.lambda_temporal * loss_temporal
-                 + hp.lambda_latent * (loss_latent + loss_static))
+                 + hp.lambda_latent * loss_latent
+                 + hp.lambda_static * loss_static)
         return total, {'recon': loss_recon, 'regime': loss_regime, 'geo': loss_geo,
                        'decorr': loss_decorr, 'temporal': loss_temporal,
                        'latent': loss_latent, 'static': loss_static}
