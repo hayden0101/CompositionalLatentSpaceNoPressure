@@ -1,0 +1,11 @@
+diff --git a/data/dataset.py b/data/dataset.py
+--- a/data/dataset.py
++++ b/data/dataset.py
+@@
+-        fields : (3, H, W) target flow field (u, v, p)
++        fields : (2, H, W) target velocity field (u, v)
+@@
+-        fields = torch.tensor(y[:, :3], dtype=torch.float32) # u, v, p only
++        # Run-1 no-pressure experiment: retain only horizontal and vertical
++        # velocity. Pressure and force-coefficient channels are excluded.
++        fields = torch.tensor(y[:, :2], dtype=torch.float32)
