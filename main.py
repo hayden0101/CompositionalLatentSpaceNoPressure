@@ -11,8 +11,9 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import CSVLogger
 from torch.utils import data
 
-from data.dataset import CompositionalLDCDataset, GroupedBatchSampler
+from data.dataset import CompositionalLDCDataset, GroupedBatchSampler, UnsteadyLDCDataset
 from models.compositional.compositional_ae import CompositionalAE
+from models.compositional.unsteady_ae import UnsteadyCompositionalAE
 
 
 def set_seed(seed):
@@ -30,26 +31,36 @@ def main(config_path, seed=None):
         config.trainer.seed = seed
     set_seed(config.trainer.seed)
 
-    data_kwargs = dict(
-        resolution=config.data.resolution,
-        unsteady=config.data.get('unsteady', False),
-        sequence_length=config.data.get('sequence_length', None),
-        sequence_stride=config.data.get('sequence_stride', 1),
-        field_channels=tuple(config.data.get('field_channels', [0, 1])),
-    )
-    train_dataset = CompositionalLDCDataset(
-        file_path_x=config.data.file_path_train_x,
-        file_path_y=config.data.file_path_train_y,
-        **data_kwargs,
-    )
-    test_dataset = CompositionalLDCDataset(
-        file_path_x=config.data.file_path_test_x,
-        file_path_y=config.data.file_path_test_y,
-        re_stats=train_dataset.re_stats,  # standardize Re with train statistics
-        **data_kwargs,
-    )
+    unsteady = bool(config.data.get('unsteady', False))
+    if unsteady:
+        train_dataset = UnsteadyLDCDataset(
+            file_path=config.data.file_path_train,
+            resolution=config.data.resolution,
+            sequence_length=config.data.sequence_length,
+            stride=config.data.get('sequence_stride', 1),
+        )
+        test_dataset = UnsteadyLDCDataset(
+            file_path=config.data.file_path_test,
+            resolution=config.data.resolution,
+            sequence_length=config.data.sequence_length,
+            stride=config.data.get('sequence_stride', 1),
+            re_stats=train_dataset.re_stats,
+        )
+    else:
+        channels = tuple(config.data.get('field_channels', [0, 1, 2]))
+        train_dataset = CompositionalLDCDataset(
+            file_path_x=config.data.file_path_train_x,
+            file_path_y=config.data.file_path_train_y,
+            resolution=config.data.resolution, field_channels=channels,
+        )
+        test_dataset = CompositionalLDCDataset(
+            file_path_x=config.data.file_path_test_x,
+            file_path_y=config.data.file_path_test_y,
+            resolution=config.data.resolution,
+            re_stats=train_dataset.re_stats, field_channels=channels,
+        )
 
-    if config.model.get('lambda_swap', 0) > 0:
+    if (not unsteady) and config.model.get('lambda_swap', 0) > 0:
         # swap consistency needs same-Re pairs across different geometries
         re_to_geos = {}
         for re_val, gid in zip(train_dataset.re.tolist(),
@@ -64,10 +75,10 @@ def main(config_path, seed=None):
             print('WARNING: no swappable pairs exist; the swap loss will be zero. '
                   'Re values likely differ across geometries.')
 
-    if config.model.get('lambda_inv', 0) > 0:
+    if (not unsteady) and config.model.get('lambda_inv', 0) > 0:
         # group-structured minibatches: same geometry at several Re per batch,
         # required for the same-factor invariance loss (L10)
-        sampler = GroupedBatchSampler(train_dataset.sample_geo_ids.tolist(),
+        sampler = GroupedBatchSampler(train_dataset.geo_ids.tolist(),
                                       batch_size=config.data.batch_size,
                                       groups_per_batch=config.data.groups_per_batch,
                                       seed=config.trainer.seed)
@@ -81,8 +92,9 @@ def main(config_path, seed=None):
                                  shuffle=False, drop_last=False,
                                  num_workers=config.data.num_workers)
 
-    model = CompositionalAE(resolution=config.data.resolution,
-                            **OmegaConf.to_container(config.model, resolve=True))
+    model_cls = UnsteadyCompositionalAE if unsteady else CompositionalAE
+    model = model_cls(resolution=config.data.resolution,
+                      **OmegaConf.to_container(config.model, resolve=True))
 
     if config.trainer.get('wandb', False):
         from pytorch_lightning.loggers import WandbLogger

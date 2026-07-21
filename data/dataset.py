@@ -10,182 +10,131 @@ from torch.utils.data import Dataset, Sampler
 
 
 class CompositionalLDCDataset(Dataset):
-    """
-    FlowBench 2D lid-driven cavity dataset wrapper.
-
-    Supported modes
-    ----------------
-    Steady state:
-        x: [N, (Re, SDF, mask), H, W]
-        y: [N, (u, v, p, ...), H, W]
-        returns fields: [C, H, W]
-
-    Unsteady state:
-        x: [N, T, (Re, SDF, mask), H, W] or [N, (Re, SDF, mask), H, W]
-        y: [N, T, C, H, W] or [N, C, T, H, W]
-        returns fields: [T, C, H, W]
-
-    By default only the velocity channels (u, v) are used. Set
-    field_channels to include pressure for the original steady-state runs.
-    """
+    """Steady FlowBench dataset, optionally restricted to selected field channels."""
 
     def __init__(self, file_path_x, file_path_y, resolution=256, re_stats=None,
-                 unsteady=False, sequence_length=None, sequence_stride=1,
-                 field_channels=(0, 1)):
+                 field_channels=(0, 1, 2)):
         x = np.load(file_path_x)['data']
         y = np.load(file_path_y)['data']
-
-        self.unsteady = bool(unsteady)
-        self.field_channels = tuple(field_channels)
-        self.sequence_length = sequence_length
-        self.sequence_stride = int(sequence_stride)
-
-        x_static, y_seq = self._normalize_layout(x, y)
-        # x_static: [N, 3, H, W], y_seq: [N, T, C, H, W]
-
-        re = torch.tensor(x_static[:, 0, 0, 0].copy(), dtype=torch.float32)
-
-        digests = [hashlib.md5(x_static[i, 1].tobytes()).hexdigest()
-                   for i in range(x_static.shape[0])]
+        re = torch.tensor(x[:, 0, 0, 0].copy(), dtype=torch.float32)
+        digests = [hashlib.md5(x[i, 1].tobytes()).hexdigest() for i in range(x.shape[0])]
         digest_to_id, geo_ids = {}, []
-        for d in digests:
-            if d not in digest_to_id:
-                digest_to_id[d] = len(digest_to_id)
-            geo_ids.append(digest_to_id[d])
-        base_geo_ids = torch.tensor(geo_ids, dtype=torch.long)
+        for digest in digests:
+            digest_to_id.setdefault(digest, len(digest_to_id))
+            geo_ids.append(digest_to_id[digest])
+        self.geo_ids = torch.tensor(geo_ids, dtype=torch.long)
 
-        sdf = torch.tensor(x_static[:, 1:2], dtype=torch.float32)
-        mask = torch.tensor(x_static[:, 2:3], dtype=torch.float32)
+        sdf = torch.tensor(x[:, 1:2], dtype=torch.float32)
+        mask = torch.tensor(x[:, 2:3], dtype=torch.float32)
         if mask.max() > 1.0:
             mask = mask / 255.0
-
-        fields = torch.tensor(y_seq[:, :, self.field_channels], dtype=torch.float32)
-
+        fields = torch.tensor(y[:, list(field_channels)], dtype=torch.float32)
         if resolution is not None and resolution != fields.shape[-1]:
             size = (resolution, resolution)
-            n, t, c, h, w = fields.shape
-            fields = F.interpolate(fields.reshape(n * t, c, h, w), size=size,
-                                   mode='bilinear', align_corners=False)
-            fields = fields.reshape(n, t, c, resolution, resolution)
+            fields = F.interpolate(fields, size=size, mode='bilinear', align_corners=False)
             sdf = F.interpolate(sdf, size=size, mode='bilinear', align_corners=False)
             mask = F.interpolate(mask, size=size, mode='nearest')
-
-        log_re = torch.log10(re.clamp(min=1e-6))
-        if re_stats is None:
-            self.re_stats = (log_re.mean().item(), log_re.std().clamp(min=1e-8).item())
-        else:
-            self.re_stats = re_stats
-        log_re = (log_re - self.re_stats[0]) / self.re_stats[1]
-
-        if self.unsteady:
-            self._build_sequence_index(fields.shape[0], fields.shape[1])
-            self.fields = fields
-            self.sdf = sdf
-            self.mask = mask
-            self.re = re
-            self.log_re = log_re
-            self.geo_ids = base_geo_ids
-            self.sample_geo_ids = torch.tensor([geo_ids[i] for i, _ in self.seq_index], dtype=torch.long)
-        else:
-            # For a steady run using an unsteady file, train on the final frame.
-            self.seq_index = None
-            self.fields = fields[:, -1]
-            self.sdf = sdf
-            self.mask = mask
-            self.re = re
-            self.log_re = log_re
-            self.geo_ids = base_geo_ids
-            self.sample_geo_ids = self.geo_ids
-
-    def _normalize_layout(self, x, y):
-        if x.ndim == 5:
-            # [N, T, C, H, W] -> use the first x frame; Re/SDF/mask are static.
-            x_static = x[:, 0]
-        elif x.ndim == 4:
-            x_static = x
-        else:
-            raise ValueError(f'Unsupported x shape {x.shape}; expected 4D or 5D.')
-
-        if y.ndim == 4:
-            y_seq = y[:, None]
-        elif y.ndim == 5:
-            # Prefer [N, T, C, H, W]. If the second axis is channel-like and the
-            # third is time-like, convert [N, C, T, H, W] -> [N, T, C, H, W].
-            if y.shape[1] <= 8 and y.shape[2] > 8:
-                y_seq = np.moveaxis(y, 1, 2)
-            else:
-                y_seq = y
-        else:
-            raise ValueError(f'Unsupported y shape {y.shape}; expected 4D or 5D.')
-        return x_static, y_seq
-
-    def _build_sequence_index(self, n_samples, n_time):
-        if self.sequence_length is None:
-            self.sequence_length = n_time
-        if self.sequence_length < 2:
-            raise ValueError('Unsteady training requires sequence_length >= 2.')
-        if self.sequence_length > n_time:
-            raise ValueError(f'sequence_length={self.sequence_length} exceeds available T={n_time}.')
-        self.seq_index = []
-        for i in range(n_samples):
-            for start in range(0, n_time - self.sequence_length + 1, self.sequence_stride):
-                self.seq_index.append((i, start))
+        self.fields, self.sdf, self.mask, self.re = fields, sdf, mask, re
+        self.re_stats, self.log_re = _standardize_re(re, re_stats)
 
     def __len__(self):
-        return len(self.seq_index) if self.unsteady else self.fields.shape[0]
+        return self.fields.shape[0]
 
     def __getitem__(self, idx):
-        if self.unsteady:
-            sample_idx, start = self.seq_index[idx]
-            stop = start + self.sequence_length
-            return {
-                'fields': self.fields[sample_idx, start:stop],
-                'sdf': self.sdf[sample_idx],
-                'mask': self.mask[sample_idx],
-                're': self.re[sample_idx],
-                'log_re': self.log_re[sample_idx],
-                'geo_id': self.geo_ids[sample_idx],
-                'time_start': torch.tensor(start, dtype=torch.long),
-            }
-        return {
-            'fields': self.fields[idx],
-            'sdf': self.sdf[idx],
-            'mask': self.mask[idx],
-            're': self.re[idx],
-            'log_re': self.log_re[idx],
-            'geo_id': self.geo_ids[idx],
-        }
+        return {'fields': self.fields[idx], 'sdf': self.sdf[idx],
+                'mask': self.mask[idx], 're': self.re[idx],
+                'log_re': self.log_re[idx], 'geo_id': self.geo_ids[idx]}
 
     def geometry_descriptors(self):
-        solid = 1.0 - self.mask[:, 0]
-        n, h, w = solid.shape
-        area = solid.sum(dim=(1, 2)).clamp(min=1.0)
-        xs = torch.linspace(0, 1, w).view(1, 1, w)
-        ys = torch.linspace(0, 1, h).view(1, h, 1)
-        cx = (solid * xs).sum(dim=(1, 2)) / area
-        cy = (solid * ys).sum(dim=(1, 2)) / area
-        return torch.stack([area / (h * w), cx, cy], dim=1)
+        return _geometry_descriptors(self.mask)
+
+
+class UnsteadyLDCDataset(Dataset):
+    """Transient velocity-only LDC dataset.
+
+    Expected .npz keys:
+      velocity: [N,T,2,H,W], sdf: [N,1,H,W], mask: [N,1,H,W], re: [N]
+    Each item is a contiguous sequence of length ``sequence_length``.
+    """
+
+    def __init__(self, file_path, resolution=128, sequence_length=8,
+                 stride=1, re_stats=None):
+        d = np.load(file_path)
+        velocity = torch.tensor(d['velocity'], dtype=torch.float32)
+        self.sdf = torch.tensor(d['sdf'], dtype=torch.float32)
+        self.mask = torch.tensor(d['mask'], dtype=torch.float32)
+        self.re = torch.tensor(d['re'], dtype=torch.float32)
+        if self.mask.max() > 1.0:
+            self.mask /= 255.0
+        if resolution is not None and resolution != velocity.shape[-1]:
+            n, t, c, _, _ = velocity.shape
+            velocity = F.interpolate(velocity.view(n * t, c, *velocity.shape[-2:]),
+                                     size=(resolution, resolution), mode='bilinear',
+                                     align_corners=False).view(n, t, c, resolution, resolution)
+            self.sdf = F.interpolate(self.sdf, size=(resolution, resolution),
+                                     mode='bilinear', align_corners=False)
+            self.mask = F.interpolate(self.mask, size=(resolution, resolution), mode='nearest')
+        self.velocity = velocity
+        self.sequence_length = sequence_length
+        self.stride = stride
+        self.re_stats, self.log_re = _standardize_re(self.re, re_stats)
+
+        digests = [hashlib.md5(self.sdf[i].numpy().tobytes()).hexdigest()
+                   for i in range(self.sdf.shape[0])]
+        mapping = {}
+        self.geo_ids = torch.tensor([mapping.setdefault(x, len(mapping)) for x in digests])
+        self.windows = []
+        max_start = velocity.shape[1] - (sequence_length - 1) * stride
+        if max_start <= 0:
+            raise ValueError('sequence_length/stride exceed the number of stored frames')
+        for sim in range(velocity.shape[0]):
+            for start in range(max_start):
+                self.windows.append((sim, start))
+
+    def __len__(self):
+        return len(self.windows)
+
+    def __getitem__(self, idx):
+        sim, start = self.windows[idx]
+        ids = start + torch.arange(self.sequence_length) * self.stride
+        return {'fields': self.velocity[sim, ids], 'sdf': self.sdf[sim],
+                'mask': self.mask[sim], 're': self.re[sim],
+                'log_re': self.log_re[sim], 'geo_id': self.geo_ids[sim],
+                'time_index': torch.tensor(start, dtype=torch.long)}
+
+    def geometry_descriptors(self):
+        return _geometry_descriptors(self.mask)
+
+
+def _standardize_re(re, re_stats):
+    log_re = torch.log10(re.clamp(min=1e-6))
+    if re_stats is None:
+        re_stats = (log_re.mean().item(), log_re.std().clamp(min=1e-8).item())
+    return re_stats, (log_re - re_stats[0]) / re_stats[1]
+
+
+def _geometry_descriptors(mask):
+    solid = 1.0 - mask[:, 0]
+    n, h, w = solid.shape
+    area = solid.sum(dim=(1, 2)).clamp(min=1.0)
+    xs = torch.linspace(0, 1, w).view(1, 1, w)
+    ys = torch.linspace(0, 1, h).view(1, h, 1)
+    cx = (solid * xs).sum(dim=(1, 2)) / area
+    cy = (solid * ys).sum(dim=(1, 2)) / area
+    return torch.stack([area / (h * w), cx, cy], dim=1)
 
 
 class GroupedBatchSampler(Sampler):
-    """Group-structured minibatches for same-factor invariance."""
-
     def __init__(self, group_ids, batch_size, groups_per_batch=4, seed=0):
         if batch_size % groups_per_batch != 0:
             raise ValueError('batch_size must be divisible by groups_per_batch')
         self.samples_per_group = batch_size // groups_per_batch
-        self.groups_per_batch = groups_per_batch
-        self.seed = seed
-        self.epoch = 0
-
+        self.groups_per_batch, self.seed, self.epoch = groups_per_batch, seed, 0
         self.groups = defaultdict(list)
         for idx, gid in enumerate(group_ids):
             self.groups[int(gid)].append(idx)
-
-        max_group = max(len(v) for v in self.groups.values())
-        if max_group < 2:
-            warnings.warn('Every geometry appears only once in this dataset; '
-                          'the same-factor invariance loss will be zero.')
+        if max(len(v) for v in self.groups.values()) < 2:
+            warnings.warn('Every geometry appears only once; invariance loss will be zero.')
 
     def _chunks(self, rng):
         chunks = []
@@ -205,11 +154,8 @@ class GroupedBatchSampler(Sampler):
         self.epoch += 1
         chunks = self._chunks(rng)
         for b in range(len(chunks) // self.groups_per_batch):
-            batch = []
-            for chunk in chunks[b * self.groups_per_batch:(b + 1) * self.groups_per_batch]:
-                batch.extend(chunk)
-            yield batch
+            yield sum(chunks[b * self.groups_per_batch:(b + 1) * self.groups_per_batch], [])
 
     def __len__(self):
-        n_chunks = sum(-(-len(v) // self.samples_per_group) for v in self.groups.values())
-        return n_chunks // self.groups_per_batch
+        n = sum(-(-len(v) // self.samples_per_group) for v in self.groups.values())
+        return n // self.groups_per_batch

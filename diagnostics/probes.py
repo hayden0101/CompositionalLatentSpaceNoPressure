@@ -32,28 +32,12 @@ from models.compositional.compositional_ae import CompositionalAE
 def encode_dataset(model, dataset, batch_size=16, device='cpu'):
     loader = data.DataLoader(dataset, batch_size=batch_size, shuffle=False)
     blocks = {'z_mu': [], 'z_g': [], 'z_xi': []}
-    if getattr(model.hparams, 'unsteady', False):
-        blocks['z_eta'] = []
     for batch in loader:
-        fields = batch['fields'].to(device)
-        sdf = batch['sdf'].to(device)
-        if fields.ndim == 5:
-            b, t, c, h, w = fields.shape
-            flat = fields.reshape(b * t, c, h, w)
-            sdf_flat = sdf[:, None].expand(b, t, 1, h, w).reshape(b * t, 1, h, w)
-            z_mu, z_g, z_eta, z_xi = model.encode(flat, sdf_flat)
-            # Average static blocks across time for sequence-level probes.
-            z_mu = z_mu.reshape(b, t, -1).mean(1)
-            z_g = z_g.reshape(b, t, -1).mean(1)
-            z_xi = z_xi.reshape(b, t, -1).mean(1)
-            z_eta = z_eta.reshape(b, t, -1).mean(1)
-        else:
-            z_mu, z_g, z_eta, z_xi = model.encode(fields, sdf)
+        z_mu, z_g, z_xi = model.encode(batch['fields'].to(device),
+                                       batch['sdf'].to(device))
         blocks['z_mu'].append(z_mu.cpu())
         blocks['z_g'].append(z_g.cpu())
         blocks['z_xi'].append(z_xi.cpu())
-        if 'z_eta' in blocks:
-            blocks['z_eta'].append(z_eta.cpu())
     return {k: torch.cat(v).numpy() for k, v in blocks.items()}
 
 
@@ -126,9 +110,9 @@ def _paired_decode_error(model, dataset, idx_i, idx_k, idx_m, batch_size):
     swap_sum, recon_sum, donor_sum, n = 0.0, 0.0, 0.0, 0
     for b in range(0, idx_i.numel(), batch_size):
         bi, bk, bm = idx_i[b:b + batch_size], idx_k[b:b + batch_size], idx_m[b:b + batch_size]
-        z_mu_i, _, _, _ = model.encode(dataset.fields[bi], dataset.sdf[bi])
-        _, z_g_k, _, z_xi_k = model.encode(dataset.fields[bk], dataset.sdf[bk])
-        z_mu_m, z_g_m, _, z_xi_m = model.encode(dataset.fields[bm], dataset.sdf[bm])
+        z_mu_i, _, _ = model.encode(dataset.fields[bi], dataset.sdf[bi])
+        _, z_g_k, z_xi_k = model.encode(dataset.fields[bk], dataset.sdf[bk])
+        z_mu_m, z_g_m, z_xi_m = model.encode(dataset.fields[bm], dataset.sdf[bm])
         fields_m, mask_m = dataset.fields[bm], dataset.mask[bm]
 
         recon_swap = model.decoder(torch.cat([z_mu_i, z_g_k, z_xi_k], dim=1))
@@ -146,24 +130,17 @@ def _paired_decode_error(model, dataset, idx_i, idx_k, idx_m, batch_size):
 def main(config_path, checkpoint_path, split='test'):
     config = OmegaConf.load(config_path)
 
-    data_kwargs = dict(
-        resolution=config.data.resolution,
-        unsteady=config.data.get('unsteady', False),
-        sequence_length=config.data.get('sequence_length', None),
-        sequence_stride=config.data.get('sequence_stride', 1),
-        field_channels=tuple(config.data.get('field_channels', [0, 1])),
-    )
     train_dataset = CompositionalLDCDataset(
         file_path_x=config.data.file_path_train_x,
         file_path_y=config.data.file_path_train_y,
-        **data_kwargs,
+        resolution=config.data.resolution,
     )
     if split == 'test':
         dataset = CompositionalLDCDataset(
             file_path_x=config.data.file_path_test_x,
             file_path_y=config.data.file_path_test_y,
+            resolution=config.data.resolution,
             re_stats=train_dataset.re_stats,
-            **data_kwargs,
         )
     else:
         dataset = train_dataset
@@ -195,12 +172,7 @@ def main(config_path, checkpoint_path, split='test'):
           'geometry targets high from z_g only.')
 
     swap_metrics = {}
-    if config.data.get('unsteady', False):
-        print('\nSwap diagnostics are currently implemented for steady samples only; skipping for unsteady sequences.')
-        fns = []
-    else:
-        fns = [('same_re', swap_error), ('cross_re', cross_re_swap_error)]
-    for name, fn in fns:
+    for name, fn in [('same_re', swap_error), ('cross_re', cross_re_swap_error)]:
         result = fn(model, dataset)
         if result is None:
             print(f'\n{name} swap: no eligible pairs in this split.')

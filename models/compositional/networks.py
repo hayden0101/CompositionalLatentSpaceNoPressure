@@ -14,17 +14,14 @@ def conv_block(in_ch, out_ch, stride=1):
 
 class FieldEncoder(nn.Module):
     """
-    Convolutional encoder E: velocity/flow field -> block-structured latent.
-
-    Steady mode returns z = [z_mu || z_g || z_xi]. Unsteady mode can
-    additionally return z_eta for the instantaneous dynamics state.
+    Convolutional encoder E: flow field (u, v, p) -> block-structured latent
+    z = [z_mu || z_g || z_xi].
     """
 
-    def __init__(self, in_channels=2, resolution=256, base_channels=32,
-                 latent_mu=4, latent_g=32, latent_xi=16, latent_eta=0,
-                 max_channels=256):
+    def __init__(self, in_channels=3, resolution=256, base_channels=32,
+                 latent_mu=4, latent_g=32, latent_xi=16, max_channels=256):
         super().__init__()
-        n_down = int(math.log2(resolution // 8))
+        n_down = int(math.log2(resolution // 8))  # downsample to 8x8
         channels = [min(base_channels * 2 ** i, max_channels) for i in range(n_down)]
 
         layers = [conv_block(in_channels, channels[0])]
@@ -37,21 +34,21 @@ class FieldEncoder(nn.Module):
 
         feat_dim = channels[-1] * 4 * 4
         self.head_mu = nn.Linear(feat_dim, latent_mu)
+        # latent_g = 0 means the geometry block comes from a separate static
+        # encoder (SDFEncoder) instead of the flow field
         self.head_g = nn.Linear(feat_dim, latent_g) if latent_g > 0 else None
-        self.head_eta = nn.Linear(feat_dim, latent_eta) if latent_eta > 0 else None
         self.head_xi = nn.Linear(feat_dim, latent_xi)
 
     def forward(self, fields):
         h = self.pool(self.conv(fields)).flatten(1)
         z_g = self.head_g(h) if self.head_g is not None else None
-        z_eta = self.head_eta(h) if self.head_eta is not None else None
-        return self.head_mu(h), z_g, z_eta, self.head_xi(h)
+        return self.head_mu(h), z_g, self.head_xi(h)
 
 
 class SDFEncoder(nn.Module):
     """
     Static geometry encoder E_g: SDF -> z_g. Because the SDF does not depend
-    on the operating condition or time, z_g is invariant by construction.
+    on the operating condition, z_g is Reynolds-invariant by construction.
     """
 
     def __init__(self, resolution=256, base_channels=32, latent_g=32,
@@ -74,9 +71,11 @@ class SDFEncoder(nn.Module):
 
 
 class FieldDecoder(nn.Module):
-    """Convolutional decoder D: latent vector -> velocity/flow field."""
+    """
+    Convolutional decoder D: z = [z_mu || z_g || z_xi] -> flow field (u, v, p).
+    """
 
-    def __init__(self, latent_dim, out_channels=2, resolution=256,
+    def __init__(self, latent_dim, out_channels=3, resolution=256,
                  base_channels=32, max_channels=256):
         super().__init__()
         n_up = int(math.log2(resolution // 8))
@@ -140,15 +139,18 @@ class SDFHead(nn.Module):
 
 
 class LatentTimeStepper(nn.Module):
-    """MLP latent propagator Phi: [z_mu, z_g, z_eta, z_xi] -> z_eta_next."""
+    """Residual MLP propagator Phi for the dynamics code z_eta."""
 
-    def __init__(self, latent_dim, latent_eta, hidden=128):
+    def __init__(self, latent_eta, latent_mu=4, latent_g=32, hidden=128):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(latent_dim, hidden), nn.GELU(),
-            nn.Linear(hidden, hidden), nn.GELU(),
+            nn.Linear(latent_eta + latent_mu + latent_g, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
             nn.Linear(hidden, latent_eta),
         )
 
-    def forward(self, z):
-        return self.net(z)
+    def forward(self, z_eta, z_mu, z_g):
+        delta = self.net(torch.cat([z_eta, z_mu, z_g], dim=1))
+        return z_eta + delta

@@ -1,7 +1,7 @@
 # Compositional Latent Space for Geometry-Dependent Flow Fields
 
 Starter implementation of the compositional operator-network framework
-(see `notes/`) on the **FlowBench 2D lid-driven cavity** dataset — steady/unsteady and unsteady
+(see `notes/`) on the **FlowBench 2D lid-driven cavity** dataset — steady
 flow with an object inside the cavity.
 
 ## What is implemented (simple version — Path A)
@@ -48,7 +48,7 @@ FlowBench 2D LDC (NS), 512×512 `.npz` tensors:
 [LDC_NS_2D on Hugging Face](https://huggingface.co/datasets/BGLab/FlowBench/tree/main/LDC_NS_2D/512x512)
 
 - `x`: `[N, (Re, SDF, mask), 512, 512]`
-- `y`: steady `[N, (u, v, p, ...), H, W]` or unsteady `[N, T, C, H, W]` / `[N, C, T, H, W]`. By default only velocity channels `(u, v)` are used, so pressure is excluded.
+- `y`: `[N, (u, v, p, c_d, c_l), 512, 512]` (only u, v, p are used)
 
 Set the file paths in `configs/compositional/conf.yaml`.
 
@@ -80,15 +80,27 @@ for Weights & Biases.
 Repository template from
 [Geometry Matters (FlowBench benchmark)](https://arxiv.org/pdf/2501.01453).
 
+## Unsteady velocity-only LDC extension
 
-## Unsteady velocity-only mode
+The unsteady pipeline uses transient sequences with shape `[N,T,2,H,W]` and
+never stores or predicts pressure. To generate an initial dataset from the same
+FlowBench geometry/Re inputs:
 
-Use `configs/compositional/unsteady_velocity.yaml` for time-dependent LDC data.
-This mode expects consecutive velocity frames, reconstructs only `(u, v)`, adds a
-dynamics block `z_eta`, and trains a latent time-stepper `Phi` with the
-`lambda_temporal` one-step rollout loss. Pressure is not loaded when
-`field_channels: [0, 1]`.
+```bash
+python data/generate_unsteady_ldc.py \
+  --input-x /path/to/all_ldc_train_x.npz \
+  --output /work/mech-ai/haydenc1/data/unsteady_ldc_train.npz \
+  --resolution 128 --steps 1000 --save-every 20
+```
+
+Repeat for the test x-file, update the two paths in
+`configs/compositional/unsteady_velocity.yaml`, then train with:
 
 ```bash
 python main.py --config configs/compositional/unsteady_velocity.yaml
 ```
+
+The generated file contains `velocity`, `sdf`, `mask`, and `re`. Pressure is
+used only as an internal projection variable in the simple generator and is not
+saved. Validate the generator against a trusted CFD solver before using the
+results as publication-quality ground truth.

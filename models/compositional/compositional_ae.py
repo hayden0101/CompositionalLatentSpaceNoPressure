@@ -3,11 +3,14 @@ import torch
 import torch.nn.functional as F
 
 from models.compositional.networks import (FieldEncoder, FieldDecoder,
-                                           RegimeHead, SDFHead, SDFEncoder,
-                                           LatentTimeStepper)
+                                           RegimeHead, SDFHead, SDFEncoder)
 
 
 def same_factor_invariance(z, group_ids):
+    """Same-factor invariance (loss L10 of the working notes): penalize the
+    variance of a latent block across batch samples that share a factor
+    (here: the same geometry at different Re). Requires group-structured
+    minibatches so that groups actually co-occur in the batch."""
     loss = z.new_zeros(())
     count = 0
     for gid in group_ids.unique():
@@ -20,8 +23,10 @@ def same_factor_invariance(z, group_ids):
 
 
 def cross_block_correlation(a, b, eps=1e-8):
-    if a is None or b is None or a.shape[0] < 2:
-        return torch.zeros((), device=a.device if a is not None else b.device)
+    """Mean absolute Pearson correlation between coordinates of two latent blocks
+    (loss L6 of the working notes), computed across the batch."""
+    if a.shape[0] < 2:
+        return a.new_zeros(())
     a = (a - a.mean(0)) / (a.std(0) + eps)
     b = (b - b.mean(0)) / (b.std(0) + eps)
     corr = a.t() @ b / (a.shape[0] - 1)
@@ -30,135 +35,84 @@ def cross_block_correlation(a, b, eps=1e-8):
 
 class CompositionalAE(pl.LightningModule):
     """
-    Compositional autoencoder for steady or unsteady LDC flow.
+    Path A of the compositional framework (working notes §12), specialized to
+    steady lid-driven cavity flow with a geometry inside.
 
-    Steady latent:
-        z = [z_mu || z_g || z_xi]
+    Block-structured latent z = [z_mu || z_g || z_xi]:
+        z_mu : regime block, aligned with log Re via a regression head
+        z_g  : geometry block, aligned with the object SDF via a small SDF decoder
+        z_xi : residual block, absorbs whatever reconstruction needs beyond (mu, g)
 
-    Unsteady latent:
-        z_t = [z_mu || z_g || z_eta_t || z_xi_t]
-        Phi(z_t) predicts z_eta_{t+1}
+    The flow is steady, so there is no dynamics block z_eta and no propagator.
 
-    By setting in_channels=2 and field_channels=(0, 1) in the dataset, the
-    model reconstructs velocity only: horizontal velocity u and vertical
-    velocity v. Pressure is excluded.
+    Losses: masked L2 reconstruction (L1), regime supervision, geometry
+    supervision, and Pearson cross-block decorrelation (L6).
     """
 
-    def __init__(self, in_channels=2, resolution=256, base_channels=32,
-                 latent_mu=4, latent_g=32, latent_eta=16, latent_xi=16,
-                 sdf_resolution=64, static_geometry=False, unsteady=False,
-                 lambda_recon=1.0, lambda_temporal=0.0, lambda_bl=0.0,
+    def __init__(self, in_channels=3, resolution=256, base_channels=32,
+                 latent_mu=4, latent_g=32, latent_xi=16, sdf_resolution=64,
+                 static_geometry=False, lambda_recon=1.0, lambda_bl=0.0,
                  lambda_regime=0.1, lambda_geo=0.1, lambda_decorr=0.01,
                  lambda_inv=0.0, lambda_swap=0.0, lambda_xswap=0.0, lr=1e-3):
         super().__init__()
         self.save_hyperparameters()
 
-        dynamic_dim = latent_eta if unsteady else 0
-        latent_dim = latent_mu + latent_g + dynamic_dim + latent_xi
-
+        latent_dim = latent_mu + latent_g + latent_xi
         if static_geometry:
+            # z_g comes from a dedicated SDF encoder (Re-invariant by
+            # construction); the field encoder produces only z_mu and z_xi
             self.encoder = FieldEncoder(in_channels, resolution, base_channels,
-                                        latent_mu, 0, latent_xi, dynamic_dim)
+                                        latent_mu, 0, latent_xi)
             self.geom_encoder = SDFEncoder(resolution, base_channels, latent_g)
         else:
             self.encoder = FieldEncoder(in_channels, resolution, base_channels,
-                                        latent_mu, latent_g, latent_xi, dynamic_dim)
+                                        latent_mu, latent_g, latent_xi)
         self.decoder = FieldDecoder(latent_dim, in_channels, resolution, base_channels)
         self.regime_head = RegimeHead(latent_mu)
         self.sdf_head = SDFHead(latent_g, sdf_resolution, base_channels)
-        self.time_stepper = (LatentTimeStepper(latent_dim, latent_eta)
-                             if unsteady else None)
-
-    def _cat(self, z_mu, z_g, z_xi, z_eta=None):
-        parts = [z_mu, z_g]
-        if self.hparams.unsteady:
-            parts.append(z_eta)
-        parts.append(z_xi)
-        return torch.cat(parts, dim=1)
 
     def encode(self, fields, sdf=None):
-        z_mu, z_g, z_eta, z_xi = self.encoder(fields)
+        z_mu, z_g, z_xi = self.encoder(fields)
         if self.hparams.static_geometry:
             if sdf is None:
                 raise ValueError('static_geometry model needs the sdf to encode')
             z_g = self.geom_encoder(sdf)
-        return z_mu, z_g, z_eta, z_xi
+        return z_mu, z_g, z_xi
 
     def forward(self, fields, sdf=None):
-        if fields.ndim == 5:
-            return self.forward_sequence(fields, sdf)
-        z_mu, z_g, z_eta, z_xi = self.encode(fields, sdf)
-        recon = self.decoder(self._cat(z_mu, z_g, z_xi, z_eta))
-        return recon, (z_mu, z_g, z_eta, z_xi)
-
-    def forward_sequence(self, fields, sdf):
-        b, t, c, h, w = fields.shape
-        flat = fields.reshape(b * t, c, h, w)
-        sdf_flat = sdf[:, None].expand(b, t, 1, h, w).reshape(b * t, 1, h, w)
-        z_mu, z_g, z_eta, z_xi = self.encode(flat, sdf_flat)
-        recon = self.decoder(self._cat(z_mu, z_g, z_xi, z_eta))
-        recon = recon.reshape(b, t, c, h, w)
-        shape = (b, t, -1)
-        return recon, (z_mu.reshape(*shape), z_g.reshape(*shape),
-                       z_eta.reshape(*shape), z_xi.reshape(*shape))
+        z_mu, z_g, z_xi = self.encode(fields, sdf)
+        recon = self.decoder(torch.cat([z_mu, z_g, z_xi], dim=1))
+        return recon, (z_mu, z_g, z_xi)
 
     def masked_recon_loss(self, recon, fields, mask, per_channel=False):
-        if fields.ndim == 5:
-            mask = mask[:, None]
-        recon = recon * mask
+        """MSE over the fluid region only, normalized by fluid node count."""
+        recon = recon * mask  # zero out predictions inside the solid
         se = (recon - fields) ** 2
-        reduce_dims = tuple(range(1, se.ndim))
-        node_count = mask.sum(dim=tuple(range(1, mask.ndim))).clamp(min=1.0)
-        channel_factor = fields.shape[-3]
-        full = (se.sum(dim=reduce_dims) / (node_count * channel_factor)).mean()
+        node_count = mask.sum(dim=(1, 2, 3)).clamp(min=1.0)
+        full = (se.sum(dim=(1, 2, 3)) / node_count).mean()
         if not per_channel:
             return full
-        if fields.ndim == 5:
-            per = [(se[:, :, i].sum(dim=(1, 2, 3)) / node_count).mean()
-                   for i in range(se.shape[2])]
-        else:
-            per = [(se[:, i].sum(dim=(1, 2)) / node_count).mean()
-                   for i in range(se.shape[1])]
+        per = [(se[:, i].sum(dim=(1, 2)) / node_count).mean() for i in range(se.shape[1])]
         return full, per
 
     def boundary_recon_loss(self, recon, fields, mask, sdf):
+        """Boundary-layer weighted reconstruction (loss L3 of the working
+        notes): the same masked MSE, restricted to the near-object band
+        0 <= SDF <= 0.2 — the region the benchmark's M2 score measures.
+        Normalizing by the band's own pixel count (not the fluid count) is
+        what gives these thin-band pixels real weight: the band is only a few
+        percent of the fluid, so under L1 alone its errors are diluted away."""
         band = mask * ((sdf >= 0) & (sdf <= 0.2)).float()
-        if fields.ndim == 5:
-            band = band[:, None]
-            mask = mask[:, None]
-        se = ((recon * mask - fields) ** 2 * band).sum(dim=tuple(range(1, fields.ndim)))
-        count = band.sum(dim=tuple(range(1, band.ndim))).clamp(min=1.0)
-        channel_factor = fields.shape[-3]
-        return (se / (count * channel_factor)).mean()
-
-    def temporal_loss(self, fields, sdf, mask):
-        """One-step latent rollout loss for unsteady flow.
-
-        Encode every true frame, advance z_eta_t with Phi, then decode using
-        the next frame's residual z_xi_{t+1}. This makes the dynamics block
-        responsible for time evolution while avoiding a brittle requirement
-        that z_xi be perfectly time-invariant at the start of experiments.
-        """
-        if not self.hparams.unsteady or fields.shape[1] < 2:
-            return fields.new_zeros(())
-        recon, (z_mu, z_g, z_eta, z_xi) = self.forward_sequence(fields, sdf)
-        z_now = self._cat(z_mu[:, :-1].reshape(-1, z_mu.shape[-1]),
-                          z_g[:, :-1].reshape(-1, z_g.shape[-1]),
-                          z_xi[:, :-1].reshape(-1, z_xi.shape[-1]),
-                          z_eta[:, :-1].reshape(-1, z_eta.shape[-1]))
-        eta_next = self.time_stepper(z_now)
-        z_pred = self._cat(z_mu[:, :-1].reshape(-1, z_mu.shape[-1]),
-                           z_g[:, :-1].reshape(-1, z_g.shape[-1]),
-                           z_xi[:, 1:].reshape(-1, z_xi.shape[-1]),
-                           eta_next)
-        pred = self.decoder(z_pred)
-        b, t, c, h, w = fields[:, 1:].shape
-        pred = pred.reshape(b, t, c, h, w)
-        return self.masked_recon_loss(pred, fields[:, 1:], mask)
+        se = ((recon * mask - fields) ** 2 * band).sum(dim=(1, 2, 3))
+        count = band.sum(dim=(1, 2, 3)).clamp(min=1.0)
+        return (se / count).mean()
 
     def swap_consistency(self, z_mu, z_g, z_xi, batch):
-        if batch['fields'].ndim == 5:
-            return z_mu.new_zeros(()), 0
+        """Swap consistency (loss L12 of the working notes): for in-batch pairs
+        (i, k) at the same Re but different geometry, decoding [z_mu from i ||
+        z_g, z_xi from k] must reproduce sample k's true field. This demands the
+        regime code be functionally interchangeable across geometries at fixed
+        dynamic similarity. Returns (loss, number_of_pairs)."""
         re, gid = batch['re'], batch['geo_id']
         n = re.shape[0]
         same_re = re.view(-1, 1) == re.view(1, -1)
@@ -166,17 +120,22 @@ class CompositionalAE(pl.LightningModule):
         idx_i, idx_k = torch.nonzero(same_re & diff_geo, as_tuple=True)
         if idx_i.numel() == 0:
             return z_mu.new_zeros(()), 0
-        if idx_i.numel() > n:
+        if idx_i.numel() > n:  # cap decode cost at one extra batch
             keep = torch.randperm(idx_i.numel(), device=idx_i.device)[:n]
             idx_i, idx_k = idx_i[keep], idx_k[keep]
-        z_swap = self._cat(z_mu[idx_i], z_g[idx_k], z_xi[idx_k], None)
+        z_swap = torch.cat([z_mu[idx_i], z_g[idx_k], z_xi[idx_k]], dim=1)
         recon = self.decoder(z_swap)
-        loss = self.masked_recon_loss(recon, batch['fields'][idx_k], batch['mask'][idx_k])
+        loss = self.masked_recon_loss(recon, batch['fields'][idx_k],
+                                      batch['mask'][idx_k])
         return loss, idx_i.numel()
 
     def cross_swap_consistency(self, z_mu, z_g, z_xi, batch):
-        if batch['fields'].ndim == 5:
-            return z_mu.new_zeros(()), 0
+        """Cross-Re swap (training form of the transfer test): for in-batch
+        triples (i, k, m) with re_m == re_i, geo_m == geo_k != geo_i and
+        re_k != re_i, decoding [z_mu from i || z_g, z_xi from k] must
+        reproduce sample m — geometry k moved to operating point Re_i. This
+        forces the decoder to take Re from z_mu and treat (z_g, z_xi) as
+        Re-free. Returns (loss, number_of_triples)."""
         re, gid = batch['re'], batch['geo_id']
         n = re.shape[0]
         same_re = re.view(-1, 1) == re.view(1, -1)
@@ -190,39 +149,25 @@ class CompositionalAE(pl.LightningModule):
                 idx_i.append(i); idx_k.append(k); idx_m.append(m)
         if not idx_i:
             return z_mu.new_zeros(()), 0
-        if len(idx_i) > n:
+        if len(idx_i) > n:  # cap decode cost at one extra batch
             keep = torch.randperm(len(idx_i))[:n].tolist()
             idx_i = [idx_i[j] for j in keep]
             idx_k = [idx_k[j] for j in keep]
             idx_m = [idx_m[j] for j in keep]
-        z_swap = self._cat(z_mu[idx_i], z_g[idx_k], z_xi[idx_k], None)
+        z_swap = torch.cat([z_mu[idx_i], z_g[idx_k], z_xi[idx_k]], dim=1)
         recon = self.decoder(z_swap)
-        loss = self.masked_recon_loss(recon, batch['fields'][idx_m], batch['mask'][idx_m])
+        loss = self.masked_recon_loss(recon, batch['fields'][idx_m],
+                                      batch['mask'][idx_m])
         return loss, len(idx_i)
 
     def _losses(self, batch):
         fields, mask = batch['fields'], batch['mask']
-        recon, latents = self(fields, batch['sdf'])
-        z_mu, z_g, z_eta, z_xi = latents
+        recon, (z_mu, z_g, z_xi) = self(fields, batch['sdf'])
 
         loss_recon = self.masked_recon_loss(recon, fields, mask)
-        if fields.ndim == 5:
-            # z_mu should be time-invariant; supervise every encoded frame.
-            target_re = batch['log_re'][:, None].expand(-1, fields.shape[1]).reshape(-1)
-            loss_regime = F.mse_loss(self.regime_head(z_mu.reshape(-1, z_mu.shape[-1])), target_re)
-            z_g_for_geo = z_g[:, 0]
-            z_g_for_decorr = z_g.reshape(-1, z_g.shape[-1])
-            z_mu_for_decorr = z_mu.reshape(-1, z_mu.shape[-1])
-            z_xi_for_decorr = z_xi.reshape(-1, z_xi.shape[-1])
-            z_eta_for_decorr = z_eta.reshape(-1, z_eta.shape[-1])
-        else:
-            loss_regime = F.mse_loss(self.regime_head(z_mu), batch['log_re'])
-            z_g_for_geo = z_g
-            z_g_for_decorr = z_g
-            z_mu_for_decorr = z_mu
-            z_xi_for_decorr = z_xi
-            z_eta_for_decorr = z_eta
+        loss_regime = F.mse_loss(self.regime_head(z_mu), batch['log_re'])
 
+        # L3: extra reconstruction pressure on the boundary-layer band
         if self.hparams.lambda_bl > 0:
             loss_bl = self.boundary_recon_loss(recon, fields, mask, batch['sdf'])
         else:
@@ -230,43 +175,36 @@ class CompositionalAE(pl.LightningModule):
 
         sdf_lr = F.interpolate(batch['sdf'], size=self.sdf_head.resolution,
                                mode='bilinear', align_corners=False)
-        loss_geo = F.mse_loss(self.sdf_head(z_g_for_geo), sdf_lr)
+        loss_geo = F.mse_loss(self.sdf_head(z_g), sdf_lr)
 
-        corr_terms = [cross_block_correlation(z_mu_for_decorr, z_g_for_decorr),
-                      cross_block_correlation(z_mu_for_decorr, z_xi_for_decorr),
-                      cross_block_correlation(z_g_for_decorr, z_xi_for_decorr)]
-        if self.hparams.unsteady:
-            corr_terms.extend([
-                cross_block_correlation(z_eta_for_decorr, z_mu_for_decorr),
-                cross_block_correlation(z_eta_for_decorr, z_g_for_decorr),
-                cross_block_correlation(z_eta_for_decorr, z_xi_for_decorr),
-            ])
-        loss_decorr = sum(corr_terms) / len(corr_terms)
+        loss_decorr = (cross_block_correlation(z_mu, z_g)
+                       + cross_block_correlation(z_mu, z_xi)
+                       + cross_block_correlation(z_g, z_xi)) / 3.0
 
-        loss_inv = same_factor_invariance(z_g_for_geo, batch['geo_id'])
+        # L10: z_g must not change across samples sharing a geometry
+        loss_inv = same_factor_invariance(z_g, batch['geo_id'])
 
+        # L12: z_mu must be recombinable across geometries at the same Re
         h = self.hparams
-        loss_temporal = (self.temporal_loss(fields, batch['sdf'], mask)
-                         if h.lambda_temporal > 0 else loss_recon.new_zeros(()))
-
         if h.lambda_swap > 0:
             loss_swap, n_pairs = self.swap_consistency(z_mu, z_g, z_xi, batch)
         else:
             loss_swap, n_pairs = loss_recon.new_zeros(()), 0
 
+        # cross-Re swap: z_mu must transfer a geometry to a new operating point
         if h.lambda_xswap > 0:
             loss_xswap, n_triples = self.cross_swap_consistency(z_mu, z_g, z_xi, batch)
         else:
             loss_xswap, n_triples = loss_recon.new_zeros(()), 0
 
-        total = (h.lambda_recon * loss_recon + h.lambda_temporal * loss_temporal
-                 + h.lambda_bl * loss_bl + h.lambda_regime * loss_regime
+        total = (h.lambda_recon * loss_recon + h.lambda_bl * loss_bl
+                 + h.lambda_regime * loss_regime
                  + h.lambda_geo * loss_geo + h.lambda_decorr * loss_decorr
                  + h.lambda_inv * loss_inv + h.lambda_swap * loss_swap
                  + h.lambda_xswap * loss_xswap)
-        return total, {'recon': loss_recon, 'temporal': loss_temporal,
-                       'bl': loss_bl, 'regime': loss_regime, 'geo': loss_geo,
-                       'decorr': loss_decorr, 'inv': loss_inv,
+        return total, {'recon': loss_recon, 'bl': loss_bl,
+                       'regime': loss_regime,
+                       'geo': loss_geo, 'decorr': loss_decorr, 'inv': loss_inv,
                        'swap': loss_swap, 'swap_pairs': float(n_pairs),
                        'xswap': loss_xswap, 'xswap_triples': float(n_triples)}
 
@@ -283,11 +221,12 @@ class CompositionalAE(pl.LightningModule):
         for name, value in parts.items():
             self.log(f'val_loss_{name}', value)
 
+        # per-channel reconstruction errors, as in the FlowBench template
         recon, _ = self(batch['fields'], batch['sdf'])
-        full, per = self.masked_recon_loss(recon, batch['fields'], batch['mask'], per_channel=True)
+        full, per = self.masked_recon_loss(recon, batch['fields'], batch['mask'],
+                                           per_channel=True)
         self.log('val_loss_full', full, on_epoch=True)
-        channel_names = ['u', 'v'] if self.hparams.in_channels == 2 else ['u', 'v', 'p']
-        for name, value in zip(channel_names, per):
+        for name, value in zip(['u', 'v', 'p'], per):
             self.log(f'val_loss_{name}', value, on_epoch=True)
         return total
 
