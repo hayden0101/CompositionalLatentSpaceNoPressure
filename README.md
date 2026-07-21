@@ -79,28 +79,3 @@ for Weights & Biases.
 
 Repository template from
 [Geometry Matters (FlowBench benchmark)](https://arxiv.org/pdf/2501.01453).
-
-## Unsteady velocity-only LDC extension
-
-The unsteady pipeline uses transient sequences with shape `[N,T,2,H,W]` and
-never stores or predicts pressure. To generate an initial dataset from the same
-FlowBench geometry/Re inputs:
-
-```bash
-python data/generate_unsteady_ldc.py \
-  --input-x /path/to/all_ldc_train_x.npz \
-  --output /work/mech-ai/haydenc1/data/unsteady_ldc_train.npz \
-  --resolution 128 --steps 1000 --save-every 20
-```
-
-Repeat for the test x-file, update the two paths in
-`configs/compositional/unsteady_velocity.yaml`, then train with:
-
-```bash
-python main.py --config configs/compositional/unsteady_velocity.yaml
-```
-
-The generated file contains `velocity`, `sdf`, `mask`, and `re`. Pressure is
-used only as an internal projection variable in the simple generator and is not
-saved. Validate the generator against a trusted CFD solver before using the
-results as publication-quality ground truth.

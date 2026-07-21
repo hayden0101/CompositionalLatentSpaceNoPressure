@@ -136,21 +136,3 @@ class SDFHead(nn.Module):
     def forward(self, z_g):
         h = self.fc(z_g).view(-1, self.start_ch, 8, 8)
         return self.out(self.blocks(h))
-
-
-class LatentTimeStepper(nn.Module):
-    """Residual MLP propagator Phi for the dynamics code z_eta."""
-
-    def __init__(self, latent_eta, latent_mu=4, latent_g=32, hidden=128):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(latent_eta + latent_mu + latent_g, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, latent_eta),
-        )
-
-    def forward(self, z_eta, z_mu, z_g):
-        delta = self.net(torch.cat([z_eta, z_mu, z_g], dim=1))
-        return z_eta + delta
