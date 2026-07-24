@@ -24,6 +24,7 @@ from omegaconf import OmegaConf
 
 from data.no_pressure_dataset import NoPressureLDCDataset
 from models.compositional.compositional_ae import CompositionalAE
+from plotting.plot_scale import configured_error_vmax, error_ticks
 
 CHANNELS = ("u", "v")
 FIELD_CMAP = plt.get_cmap("RdBu_r").copy()
@@ -85,7 +86,7 @@ def _save(fig, outdir, name):
 
 
 @torch.no_grad()
-def reconstruction_figure(model, dataset, idx, outdir):
+def reconstruction_figure(model, dataset, idx, outdir, error_vmax):
     sample = dataset[idx]
     fields = sample["fields"].unsqueeze(0)
     reconstruction, _ = model(fields, sample["sdf"].unsqueeze(0))
@@ -105,7 +106,7 @@ def reconstruction_figure(model, dataset, idx, outdir):
     for row, channel in enumerate(CHANNELS):
         error = np.abs(prediction[row] - truth[row])
         vmax = robust_vmax(masked(truth[row], mask))
-        err_vmax = robust_vmax(masked(error, mask))
+        err_vmax = error_vmax
         im_field, im_error = _panel_row(
             axs,
             row,
@@ -118,7 +119,10 @@ def reconstruction_figure(model, dataset, idx, outdir):
             channel, fontsize=13, rotation=0, labelpad=15, va="center"
         )
         fig.colorbar(im_field, ax=axs[row, :2].tolist(), shrink=0.85, pad=0.02)
-        fig.colorbar(im_error, ax=axs[row, 2], shrink=0.85, pad=0.04)
+        error_bar = fig.colorbar(
+            im_error, ax=axs[row, 2], shrink=0.85, pad=0.04, extend="max"
+        )
+        error_bar.set_ticks(error_ticks(error_vmax))
 
     axs[0, 0].set_title("CFD truth")
     axs[0, 1].set_title("Model prediction")
@@ -174,7 +178,7 @@ def find_transfer_triple(dataset):
 
 
 @torch.no_grad()
-def transfer_figure(model, dataset, outdir):
+def transfer_figure(model, dataset, outdir, error_vmax):
     triple = find_transfer_triple(dataset)
     if triple is None:
         print("No cross-Re transfer triple found in this split; skipping transfer.")
@@ -205,7 +209,7 @@ def transfer_figure(model, dataset, outdir):
     for row, channel in enumerate(CHANNELS):
         error = np.abs(prediction[row] - truth[row])
         vmax = robust_vmax(masked(truth[row], mask))
-        err_vmax = robust_vmax(masked(error, mask))
+        err_vmax = error_vmax
         im_field, im_error = _panel_row(
             axs,
             row,
@@ -218,7 +222,10 @@ def transfer_figure(model, dataset, outdir):
             channel, fontsize=13, rotation=0, labelpad=15, va="center"
         )
         fig.colorbar(im_field, ax=axs[row, :3].tolist(), shrink=0.85, pad=0.02)
-        fig.colorbar(im_error, ax=axs[row, 3], shrink=0.85, pad=0.04)
+        error_bar = fig.colorbar(
+            im_error, ax=axs[row, 3], shrink=0.85, pad=0.04, extend="max"
+        )
+        error_bar.set_ticks(error_ticks(error_vmax))
 
     axs[0, 0].set_title(f"donor: geometry\nat Re = {donor_re:.0f}", fontsize=10)
     axs[0, 1].set_title(f"prediction\nat Re = {target_re:.0f}", fontsize=10)
@@ -232,9 +239,10 @@ def transfer_figure(model, dataset, outdir):
     _save(fig, outdir, "transfer")
 
 
-def main(config_path, checkpoint_path, outdir, n_recon):
+def main(config_path, checkpoint_path, outdir, n_recon, error_vmax_override=None):
     config = OmegaConf.load(config_path)
     configured_channels = int(config.model.get("in_channels", 2))
+    error_vmax = configured_error_vmax(config, error_vmax_override)
     if configured_channels != 2:
         raise ValueError(
             f"No-pressure plotting requires model.in_channels=2, got "
@@ -260,8 +268,9 @@ def main(config_path, checkpoint_path, outdir, n_recon):
     rng = np.random.default_rng(0)
     sample_count = min(n_recon, len(dataset))
     for idx in rng.choice(len(dataset), size=sample_count, replace=False):
-        reconstruction_figure(model, dataset, int(idx), outdir)
-    transfer_figure(model, dataset, outdir)
+        reconstruction_figure(model, dataset, int(idx), outdir, error_vmax)
+    transfer_figure(model, dataset, outdir, error_vmax)
+    print(f"Fixed error color scale: 0.00 to {error_vmax:.3f}")
 
 
 if __name__ == "__main__":
@@ -274,10 +283,20 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--outdir", type=str, default="docs/figures/no_pressure")
     parser.add_argument("--n-recon", type=int, default=2)
+    parser.add_argument(
+        "--error-vmax",
+        type=float,
+        default=None,
+        help=(
+            "Fixed upper limit for every absolute-error colorbar. "
+            "Defaults to plotting.error_vmax in the config or 0.05."
+        ),
+    )
     arguments = parser.parse_args()
     main(
         arguments.config,
         arguments.checkpoint,
         arguments.outdir,
         arguments.n_recon,
+        arguments.error_vmax,
     )
