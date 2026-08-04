@@ -1,6 +1,6 @@
 # CompositionalLatentSpace: velocity-only run suite
 
-This overlay adds eight pressure-free experiments to the current
+This overlay adds nine pressure-free experiments to the current
 `baskargroup/CompositionalLatentSpace` repository without changing its original
 three-channel workflow.
 
@@ -22,7 +22,7 @@ entry points. This keeps the original batching, loss implementation, logging,
 and checkpoint behavior intact while replacing the dataset with the velocity-
 only adapter.
 
-## Eight configurations
+## Nine configurations
 
 | Run | Change from the preceding experiment | Key settings |
 |---|---|---|
@@ -34,10 +34,11 @@ only adapter.
 | 6 | Cross-Re swap training | `lambda_xswap=0.1` |
 | 7 | Static SDF geometry encoder | `static_geometry=true` |
 | 8 | Boundary-layer reconstruction, L3 | `lambda_bl=1.0` |
+| 9 | Full 2 x 2 latent-swap grid | `lambda_fullswap=0.1` |
 
 All runs retain `lambda_recon=1.0`, `lambda_regime=0.1`,
 `lambda_geo=0.1`, 200 epochs, batch size 16, resolution 256, seed 0, and the
-same latent dimensions as the upstream experiments.
+same latent dimensions as the upstream experiments. Run 9 is a new extension beyond the paper: it starts from Run 7 and adds the four missing A/B assignments of `[z_mu | z_g | z_xi]`. Reconstruction and cross-Re training already cover the other four assignments, so the complete objective covers all eight combinations.
 
 ## Apply the overlay
 
@@ -84,7 +85,25 @@ sbatch runNova_run5_no_pressure.sh
 sbatch runNova_run6_no_pressure.sh
 sbatch runNova_run7_no_pressure.sh
 sbatch runNova_run8_no_pressure.sh
+sbatch runNova_run9_no_pressure.sh
 ```
+
+## Run 9 full-swap outputs
+
+Run 9 additionally writes:
+
+```text
+checkpoints/compositional-run9-no-pressure/<version>/full_swap_metrics.csv
+docs/figures/run9_no_pressure/full_swap_reference_grid.png
+docs/figures/run9_no_pressure/full_swap_predictions.png
+docs/figures/run9_no_pressure/full_swap_errors.png
+```
+
+The full-swap diagnostic uses complete 2 x 2 rectangles with two Reynolds
+numbers and two geometries. For source samples A and B it evaluates all eight
+latent assignments: `AAA`, `AAB`, `ABA`, `ABB`, `BAA`, `BAB`, `BBA`, and
+`BBB`. Each assignment is compared against the exact CFD field selected by the
+Reynolds source (`z_mu`) and geometry source (`z_g`).
 
 ## Environment and path overrides
 
@@ -135,6 +154,18 @@ From the repository root after applying the overlay:
 python tests/test_no_pressure_setup.py
 ```
 
-This checks all eight loss configurations, confirms two input/output channels,
+This checks all nine loss configurations, confirms two input/output channels,
 and verifies that every Nova script invokes training, diagnostics, and plotting.
 It does not replace a real data-and-GPU smoke test on Nova.
+
+## Runs 10-29: standard-swap tuning sweep
+
+Runs 10-29 use Run 7 as the baseline and change exactly one ordinary loss
+weight at a time. They use `main_no_pressure.py`,
+`diagnostics/probes_no_pressure.py`, and `plotting/figures_no_pressure.py`.
+They do not use the Run 9 full-swap loss or eight-combination diagnostics.
+See `RUNS10_29_NO_FULL_SWAP_SWEEP.md` for the complete matrix.
+
+The standard pressure-free plotting path now uses a fixed absolute-error range
+of 0.00-0.05 for both u and v, making reconstruction and transfer maps directly
+comparable across the sweep.
